@@ -15,6 +15,12 @@
 
 **结论：代码仓的 PR 比设计文档 PR 领先数天到数周。只查设计文档仓会严重低估竞争度。**
 
+第二次踩坑（同一类错误的另一面）：查 `cann-ops-competitions` 时**只看了 PR 列表**，
+漏掉了已经合入 `tasklist/2025-08/08-aclblasCtbmv-A2A3/m0_69357246/docs/design.md`
+——一份针对本任务的完整竞品设计文档。它不在任何 open PR 里，因为它已经合入了。
+
+**结论二：PR 列表 ≠ 仓库内容。已合入的东西必须靠列目录树才能发现。**
+
 ## 核查清单
 
 ### 1. 目标仓 master 上是否已存在
@@ -64,6 +70,43 @@ for f in sorted(glob.glob('ob_*.html')):
 注意分页：单页只有约 25 条。**必须翻多页**，否则会漏。
 计数可从页面里 `opened` / `merged` 字段粗略取到。
 
+### 2b. 已合入的设计文档目录树（最容易漏的一步）
+
+**PR 列表只显示"还开着"的东西。已经合入的设计文档不在 PR 列表里，
+但它同样代表一个正在做这个任务的对手。**
+
+`cann-ops-competitions` 的设计文档合入后落在 `tasklist/` 目录树里，
+路径形如 `tasklist/<期号>/<NN>-<算子名>-<arch>/<作者 ID>/docs/design.md`。
+必须**直接列目录**，不能只看 PR：
+
+```bash
+git clone --depth 1 https://gitcode.com/cann/cann-ops-competitions.git
+find cann-ops-competitions/tasklist -maxdepth 3 -type d | grep -i ctbmv
+# tasklist/2025-08/08-aclblasCtbmv-A2A3/m0_69357246/
+```
+
+或者不 clone，直接翻网页目录：
+
+```bash
+curl -sL "https://gitcode.com/cann/cann-ops-competitions/tree/master/tasklist" -o tl.html
+```
+
+**每个作者 ID 子目录 = 一个已提交设计文档的竞争者。** 逐个读他们的
+`docs/design.md`：里面通常有对方的切分策略、blockDim 选择、以及
+**他们对性能标杆的解读**（见下）。
+
+### 2c. 交叉核对性能标杆的解读
+
+任务书给的标杆 CSV 往往只说"参考值"，没说是上界还是下界。
+不同参与者可能有相反解读，例如：
+
+- 解读 A：`目标 = csv / 0.8`（允许比参考值慢 25%）
+- 解读 B：`目标 = csv * 0.8`（必须比参考值快 25%）
+
+两者差 1.56 倍。**读对手的设计文档是确认解读的最便宜方式**——
+如果所有人都按同一个式子写，那多半就是官方口径。
+仍有分歧时，把两种解读都写进自己的设计文档并说明取了哪个、为什么。
+
 ### 3. 判读 PR 状态
 
 标签含义：
@@ -92,11 +135,12 @@ for f in sorted(glob.glob('ob_*.html')):
 
 ```
 ## 竞争度报告
-| 算子 | master 状态 | 代码仓 PR | 设计文档 PR | 结论 |
-|---|---|---|---|---|
-| chemm | arch22 已合入 | — | — | 🔴 放弃 |
-| csyrk | 仅 arch35 | #348 +3772 ci-passed | 有 | 🔴 高风险 |
+| 算子 | master 状态 | 代码仓 PR | 设计文档 PR | 已合入 tasklist/ | 结论 |
+|---|---|---|---|---|---|
+| chemm | arch22 已合入 | — | — | — | 🔴 放弃 |
+| csyrk | 仅 arch35 | #348 +3772 ci-passed | 有 | m0_xxx | 🔴 高风险 |
 ...
 推荐：<任务>，理由：<...>
 待用户确认：报名是否仍开放
+性能标杆解读：csv/0.8 还是 csv*0.8（与竞品文档核对过？）
 ```
