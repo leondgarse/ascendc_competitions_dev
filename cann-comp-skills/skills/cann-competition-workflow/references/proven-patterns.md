@@ -128,6 +128,63 @@ ChemmDfLinearCombination(a0,b0,a1,b1)  // a0*b0 + a1*b1，补偿精度
 
 ---
 
+## 套路 4.5：BLAS 带状 / 打包矩阵的存储约定（踩过真实 bug）
+
+**上游 `repo-knowledge` 只列了算子清单，没写存储布局。这里补上。**
+
+BLAS 带状存储是**列主序**：元素 `(row, col)` 位于 `A[row + col * lda]`。
+
+| uplo | 主对角所在行 | 元素 A(i,j) 位置（1-based） | 不引用区域 |
+|---|---|---|---|
+| UPPER | 第 k+1 行 | `A(1+k+i-j, j)` | 数组左上角 k×k |
+| LOWER | 第 1 行 | `A(1+i-j, j)` | 数组右下角 k×k |
+
+**推论（性能上很关键）**：
+- **一条对角带** = 固定 row、变 col → **stride = lda**（跳跃访问）
+- **一整列** = 固定 col、变 row → **连续的 k+1 个元素**
+
+所以带状算子想要高效 DMA，应该**按列搬**而不是按带搬。按带搬会退化成
+"每个元素一个 8 字节 burst"，正是 hard-constraints 三点六说的最坏情况。
+
+### ⚠️ 仓内 `stbmv/arch22` 这里是错的，不要照抄
+
+`blas/tbmv/arch22/stbmv_kernel.cpp:113-114` 用
+`A[band * lda + col]` 连续读，即**行主序**，与 BLAS 约定不符。
+与 `cblas_stbmv(CblasColMajor,...)` 对比（4×4, UPPER, k=1）：
+
+```
+lda=2  cblas=[12 14 16 4]  stbmv=[12 13 14 3]   不一致
+lda=4  cblas=[12 14 16 4]  stbmv=[12  2  0 0]   不一致
+```
+
+它的 UT 40/40 通过，是因为测试数据生成用了同样的错误约定，且没走同目录下的
+cblas golden。**写带状算子时务必用 cblas golden 验证，不要参考 stbmv 的索引。**
+
+## 套路 4.6：把 per-call 的 host 开销提前到一次性
+
+**实测（910B3）**：一次阻塞 `aclrtMemcpy` H2D（64B）= **13.78us**；
+`aclrtMalloc`+`Free` = 3.49us；三者合计 ~20.9us。
+
+仓内多数算子在**每次调用**里做 malloc + 阻塞 memcpy + free 下发 tiling
+（`ccopy_host.cpp:119-132`、`cscal_host.cpp:83-105`，后者还每次上传一张 mask 表，
+所以 `cscal` 高达 157us）。
+
+**我们的做法**（实测 23.0us，快于现网 `ccopy` 28.5us）：
+1. 常量表（gather offset 之类）用 `std::call_once` **进程级缓存**，只上传一次
+2. tiling 通过 `<<<>>>` **按值传参**，不走 GM buffer，省掉整个 malloc/memcpy/free
+
+```cpp
+std::once_flag g_offsetOnce;
+uint8_t *g_offsetDevice = nullptr;
+// ... 调用处
+std::call_once(g_offsetOnce, BuildOffsetTable);
+kernel_do<<<blocks, nullptr, stream>>>(a, x, g_offsetDevice, tiling);  // tiling 按值
+```
+
+⚠️ 同时注意：**不要在算子里做阻塞 `aclrtSynchronizeStream`**。
+我们最初为了释放 offset buffer 每次都同步，占了约 40% 的耗时，
+且违反接口的异步语义。
+
 ## 套路 5：三段式稀疏接口（GetBufferSize / Preprocess / Compute）
 
 **出处**：`ops-sparse/sparse/spmm/arch22/`

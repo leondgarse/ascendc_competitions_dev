@@ -57,6 +57,53 @@
 - `op_host/*.cpp` 可 include `<cmath>`/`<algorithm>`/tiling 头；**不可** include `kernel_operator.h`
 - `op_kernel/*.cpp` 可 include `kernel_operator.h`；**不可** include `<cmath>`/`<algorithm>`/tiling 头
 
+## 三点五、向量指令的操作数偏移必须 32B 对齐（实测，代价最大的一条）
+
+**这条上游 skill 没有明确写，但它让同一个改造失败了三次。**
+
+`Add`/`Sub`/`Mul`/`Adds` 等向量指令的**每个操作数**（含目的操作数）起始地址
+必须 32 字节对齐。写成 `dst[i]` 时，只有 `i * sizeof(T)` 是 32 的整数倍才合法。
+
+```cpp
+// ✗ 错：offset = d 是任意值（band 号 0..k），只有 d % 8 == 0 时才对
+Add(yr_[lo - rowStart], yr_[lo - rowStart], t0_, cnt);
+
+// ✓ 对：built-in 的通用写法 —— 偏移永远是某个"已对齐步长"的整数倍
+int64_t calNumAlign = CeilA2B(calCount, blockSize) * blockSize;
+int64_t offset      = i * calNumAlign;
+Add(currentRow[offset], currentRow[offset], lastRow, calNumAlign);
+```
+
+依据：CANN 内置算子
+`ops_math/ascendc/exp_segsum_grad/exp_segsum_grad.h:311`、
+`grouped_bias_add_grad/arch32/...:225`（`Add(src[0], src[0], src[halfRows*cols], ...)`，
+偏移是 `cols` 的整数倍）。**内置算子无一例外地把偏移构造成 `i * 对齐步长`。**
+
+### 关键的不对称：`Gather` 没有这个限制
+
+`Gather` 接受**任意字节偏移**，向量指令不接受。同一个"错位"操作，用 `Gather`
+合法、用 `Add` 静默出错。这个不对称是最容易踩的坑。
+
+**规避手法（推荐）**：移动**源**而不是目的。让每个向量指令都写在 offset 0，
+把位移交给 GM 侧的 `DataCopyPad`（GM 元素偏移任意合法）或 `Gather`。
+
+**自查**：任何形如 `Op(dst[expr], ...)` 的向量调用，先问 `expr` 是不是某个
+32B 对齐量的整数倍；不是就改写。
+
+## 三点六、DataCopyPad 会把每个 burst 补齐到 32B（UB 侧）
+
+实测（probe kernel dump UB 内容）：`blockLen = 8` 字节的 burst，元素 i 落在
+float 偏移 `i*8` 而不是 `i*2`；**没有任何 `dstStride` 取值能让它紧凑排布**。
+
+后果：
+- 8 字节 burst 实际占 32 字节 UB 带宽 —— **4 倍浪费**
+- 想在这种"补齐"布局上用 `GatherMask`（它假设紧凑交织）会读到错位数据
+
+**正确姿势**（`cgemv/arch22` 与内置 `as_strided` 的共同做法）：
+**不要把跨步读表达成大量小 burst。一次连续搬入一个超集，再在 UB 内 `Gather`。**
+参考 `blas/common/helper/kernel_utils.h` 的 `matrix_gm2ubuf`：按列做**连续**
+拷贝并用显式 `dstStride` 控制 UB 落位。
+
 ## 四、实测经验（来自已合入代码 & 论文）
 
 - **Host↔Kernel TilingData 字段必须逐一对齐**。kernel 里是
