@@ -1,0 +1,7 @@
+build/
+out/
+*.o
+*.so
+*.run
+__pycache__/
+.DS_Store
